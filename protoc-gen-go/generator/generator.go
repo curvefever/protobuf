@@ -39,7 +39,6 @@ package generator
 import (
 	"bufio"
 	"bytes"
-	"compress/gzip"
 	"fmt"
 	"go/parser"
 	"go/printer"
@@ -501,7 +500,6 @@ type Generator struct {
 
 	Pkg map[string]string // The names under which we import support packages
 
-	packageName      string                     // What we're calling ourselves.
 	allFiles         []*FileDescriptor          // All files in the tree
 	allFilesByName   map[string]*FileDescriptor // All files by filename.
 	genFiles         []*FileDescriptor          // Those files we will generate output for.
@@ -587,7 +585,7 @@ func (g *Generator) CommandLineParameters(parameter string) {
 // Otherwise it returns the empty string.
 func (g *Generator) DefaultPackageName(obj Object) string {
 	pkg := obj.PackageName()
-	if pkg == g.packageName {
+	if pkg == uniquePackageName[g.file.FileDescriptorProto] {
 		return ""
 	}
 	return pkg + "."
@@ -674,45 +672,49 @@ func (g *Generator) defaultGoPackage() string {
 // The package name must agree across all files being generated.
 // It also defines unique package names for all imported files.
 func (g *Generator) SetPackageNames() {
-	// Register the name for this package.  It will be the first name
-	// registered so is guaranteed to be unmodified.
-	pkg, explicit := g.genFiles[0].goPackageName()
+	pkgAliases := make(map[string]string)
 
-	// Check all files for an explicit go_package option.
 	for _, f := range g.genFiles {
-		thisPkg, thisExplicit := f.goPackageName()
-		if thisExplicit {
-			if !explicit {
-				// Let this file's go_package option serve for all input files.
-				pkg, explicit = thisPkg, true
-			} else if thisPkg != pkg {
-				g.Fail("inconsistent package names:", thisPkg, pkg)
+		var thisPkgCanon string
+
+		// Does the file have a "go_package" option?
+		if opts := f.Options; opts != nil {
+			thisPkgCanon = opts.GetGoPackage()
+		}
+
+		// If we don't have an explicit "go_package" option but we have an
+		// import path, use that.
+		if thisPkgCanon == "" {
+			thisPkgCanon = g.defaultGoPackage()
+		}
+
+		// Does the file have a package clause?
+		if pkg := f.GetPackage(); pkg != "" {
+			if thisPkgCanon == "" {
+				thisPkgCanon = pkg
+			} else {
+				// have we seen this package clause before?
+				if thisPkgOtherCanon, ok := pkgAliases[pkg]; ok {
+					// did we decide the canonical package was the same?
+					if thisPkgCanon != thisPkgOtherCanon {
+						g.Fail("inconsistent package names:", thisPkgCanon, thisPkgOtherCanon)
+					}
+				} else {
+					pkgAliases[pkg] = thisPkgCanon
+				}
 			}
 		}
-	}
 
-	// If we don't have an explicit go_package option but we have an
-	// import path, use that.
-	if !explicit {
-		p := g.defaultGoPackage()
-		if p != "" {
-			pkg, explicit = p, true
+		// We still haven't figured out this file's package, use the base name.
+		if thisPkgCanon == "" {
+			thisPkgCanon = baseName(f.GetName())
 		}
-	}
 
-	// If there was no go_package and no import path to use,
-	// double-check that all the inputs have the same implicit
-	// Go package name.
-	if !explicit {
-		for _, f := range g.genFiles {
-			thisPkg, _ := f.goPackageName()
-			if thisPkg != pkg {
-				g.Fail("inconsistent package names:", thisPkg, pkg)
-			}
-		}
+		// no renaming here
+		thisPkgCanon = strings.Map(badToUnderscore, thisPkgCanon)
+		uniquePackageName[f.FileDescriptorProto] = thisPkgCanon
+		pkgNamesInUse[thisPkgCanon] = true
 	}
-
-	g.packageName = RegisterUniquePackageName(pkg, g.genFiles[0])
 
 	// Register the support package names. They might collide with the
 	// name of a package we import.
@@ -727,7 +729,6 @@ AllFiles:
 		for _, genf := range g.genFiles {
 			if f == genf {
 				// In this package already.
-				uniquePackageName[f.FileDescriptorProto] = g.packageName
 				continue AllFiles
 			}
 		}
@@ -1134,8 +1135,6 @@ func (g *Generator) generate(file *FileDescriptor) {
 	// Run the plugins before the imports so we know which imports are necessary.
 	g.runPlugins(file)
 
-	g.generateFileDescriptor(file)
-
 	// Generate header and imports last, though they appear first in the output.
 	rem := g.Buffer
 	g.Buffer = new(bytes.Buffer)
@@ -1259,7 +1258,7 @@ func (g *Generator) generateImports() {
 	for i, s := range g.file.Dependency {
 		fd := g.fileByName(s)
 		// Do not import our own package.
-		if fd.PackageName() == g.packageName {
+		if fd.PackageName() == uniquePackageName[g.file.FileDescriptorProto] {
 			continue
 		}
 		filename := goFileName(s)
@@ -1395,14 +1394,6 @@ func (g *Generator) generateEnum(enum *EnumDescriptor) {
 		g.Out()
 		g.P("}")
 	}
-
-	var indexes []string
-	for m := enum.parent; m != nil; m = m.parent {
-		// XXX: skip groups?
-		indexes = append([]string{strconv.Itoa(m.index)}, indexes...)
-	}
-	indexes = append(indexes, strconv.Itoa(enum.index))
-	g.P("func (", ccTypeName, ") EnumDescriptor() ([]byte, []int) { return fileDescriptor", g.file.index, ", []int{", strings.Join(indexes, ", "), "} }")
 
 	g.P()
 }
@@ -1804,14 +1795,6 @@ func (g *Generator) generateMessage(message *Descriptor) {
 	g.P("func (m *", ccTypeName, ") Reset() { *m = ", ccTypeName, "{} }")
 	g.P("func (m *", ccTypeName, ") String() string { return ", g.Pkg["proto"], ".CompactTextString(m) }")
 	g.P("func (*", ccTypeName, ") ProtoMessage() {}")
-	if !message.group {
-		var indexes []string
-		for m := message; m != nil; m = m.parent {
-			// XXX: skip groups?
-			indexes = append([]string{strconv.Itoa(m.index)}, indexes...)
-		}
-		g.P("func (*", ccTypeName, ") Descriptor() ([]byte, []int) { return fileDescriptor", g.file.index, ", []int{", strings.Join(indexes, ", "), "} }")
-	}
 
 	// Extension support methods
 	var hasExtensions, isMessageSet bool
@@ -2413,44 +2396,6 @@ func (g *Generator) generateInitFunction() {
 	g.Out()
 	g.P("}")
 	g.init = nil
-}
-
-func (g *Generator) generateFileDescriptor(file *FileDescriptor) {
-	// Make a copy and trim source_code_info data.
-	// TODO: Trim this more when we know exactly what we need.
-	pb := proto.Clone(file.FileDescriptorProto).(*descriptor.FileDescriptorProto)
-	pb.SourceCodeInfo = nil
-
-	b, err := proto.Marshal(pb)
-	if err != nil {
-		g.Fail(err.Error())
-	}
-
-	var buf bytes.Buffer
-	w, _ := gzip.NewWriterLevel(&buf, gzip.BestCompression)
-	w.Write(b)
-	w.Close()
-	b = buf.Bytes()
-
-	g.P("var fileDescriptor", file.index, " = []byte{")
-	g.In()
-	g.P("// ", len(b), " bytes of a gzipped FileDescriptorProto")
-	for len(b) > 0 {
-		n := 16
-		if n > len(b) {
-			n = len(b)
-		}
-
-		s := ""
-		for _, c := range b[:n] {
-			s += fmt.Sprintf("0x%02x,", c)
-		}
-		g.P(s)
-
-		b = b[n:]
-	}
-	g.Out()
-	g.P("}")
 }
 
 func (g *Generator) generateEnumRegistration(enum *EnumDescriptor) {
